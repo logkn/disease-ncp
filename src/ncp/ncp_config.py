@@ -14,9 +14,10 @@ class EncoderDecoderConfig(TypedDict):
 class NCPTrainingConfig(TypedDict):
     model_config:EncoderDecoderConfig
     learning_rate:float
-    validation_percent:float
+    validation_chains:int
     data_path:str
     sigma_lvl:float
+    batch_size:int
 
 
 DEFAULT_NCP_TRAINING_CONFIG = NCPTrainingConfig(
@@ -30,7 +31,8 @@ DEFAULT_NCP_TRAINING_CONFIG = NCPTrainingConfig(
         latent_dim = 128
     ),
     learning_rate = .005,
-    validation_percent = .15,
+    validation_chains = 1,
     data_path = "data/synthetic_data",
-    sigma_lvl = 0.5
+    sigma_lvl = 0.5,
+    batch_size = 1,
 )

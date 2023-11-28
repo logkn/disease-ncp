@@ -42,21 +42,38 @@ class SequenceLearner(pl.LightningModule):
     # - implement `self.load_data`
     # - implement visualizations (maybe move these to trainer)
     
-    def __init__(self, model, chains, lr: float = 0.005, batch_size: int = 32, validation_percent: float = 0.15):
+    def __init__(self, model, chains, lr: float = 0.005, batch_size: int = 32, n_validation_chains: int = 1):
         super().__init__()
         self.model = model
         self.lr = lr
-        # self.data_path = data_path
         # self.batch_size = batch_size
-        self.chains = chains
-        self.validation_percent = validation_percent
+        self.chains: list[pd.DataFrame]= chains
+        self.n_validation_chains = n_validation_chains
+        self.n_train_chains = len(chains) - n_validation_chains
         
         self.load_data()
 
-    def load_data(self):
-        # TODO: this function should make training and validation
-        # datasets from the chains
-        raise NotImplementedError()
+    def load_data(self, window_size: int = 100, pct_of_window_to_predict: float = 0.5):
+        """
+        Loads the data from the chains.
+
+        For each chain, we use a sliding window of size `window_size` to generate
+        the training data.
+        """
+
+        sliding_windows = []
+
+        for chain in self.chains:
+            N = len(chain)
+            chain_array = chain.drop(columns=["state"]).values.astype(np.float32)
+
+            observations_to_predict = int(window_size * pct_of_window_to_predict)
+
+            for i in range(N - window_size):
+                batch = chain_array[i:i+window_size]
+
+
+            
 
 
     # def load_data_chain(self, chain_path):
@@ -78,7 +95,7 @@ class SequenceLearner(pl.LightningModule):
     #     batched_t = torch.Tensor(self.data_t.reshape([n_batches, -1, 1]))
     #     batched_x = torch.Tensor(self.data_x.reshape([n_batches, -1, 1]))
 
-    #     train_number = int((1 - self.validation_percent) * len(batched_t))
+    #     train_number = int((1 - self.n_validation_chains) * len(batched_t))
 
     #     print("train_number", train_number)
     #     print("validation_number", len(batched_t) - train_number)
@@ -155,6 +172,9 @@ class EncoderNCP(nn.Module):
         )
 
     def forward(self, x, hidden):
+        """
+        x: (batch_size, seq_len, input_size)
+        hidden: (batch_size, latent_dim)"""
         return self.rnn(x, hidden)
 
 class DecoderNCP(nn.Module):
@@ -181,8 +201,8 @@ class DecoderNCP(nn.Module):
 class EncoderDecoderNCP:
     def __init__(self, config:EncoderDecoderConfig):
         self.latent_dim = config["latent_dim"]
-        self.encoder = EncoderNCP(config["encoder_config"], latent_dim)
-        self.decoder = DecoderNCP(config["decoder_config"], latent_dim)
+        self.encoder = EncoderNCP(config["encoder_config"], self.latent_dim)
+        self.decoder = DecoderNCP(config["decoder_config"], self.latent_dim)
 
 
     def forward(self, input_sequence, prediction_times, hidden):
@@ -193,23 +213,28 @@ class EncoderDecoderNCP:
 class NCPTrainer:
 
     def __init__(self, training_config:NCPTrainingConfig):
-        self.model_config = training_config[""]
-        self.model = EncoderDecoderNCP(model_config)
+        self.model_config = training_config["model_config"]
+        self.model = EncoderDecoderNCP(self.model_config)
         self.training_config = training_config
         self.lr = training_config["learning_rate"]
         self.data_path = training_config["data_path"]
         self.sigma_lvl = training_config["sigma_lvl"]
+        self.batch_size = training_config["batch_size"]
+        self.n_validation_chains = training_config["n_validation_chains"]
         
         self.chains = self._get_chains(self)
         self.jump_matrix = self._get_jump_matrix(self)
 
         self.learner = SequenceLearner(
             self.model,
-
+            self.chains,
+            self.lr,
+            self.batch_size,
+            self.n_validation_chains
         )
 
     def _get_jump_matrix(self):
-        sigma = str(sigma_lvl).replace(".", "_")
+        sigma = str(self.sigma_lvl).replace(".", "_")
         dir_name = f"sigma_{sigma}"
         jump_path = os.path.join(self.data_path, dir_name, "jump_matrix.csv")
         return np.loadtxt(
@@ -217,7 +242,7 @@ class NCPTrainer:
         )
 
     def _get_chains(self):
-        sigma = str(sigma_lvl).replace(".", "_")
+        sigma = str(self.sigma_lvl).replace(".", "_")
         dir_name = f"sigma_{sigma}"
         chains_path = os.path.join(self.data_path, dir_name, "chains")
         
@@ -248,12 +273,12 @@ class NCPModel:
         out_features: int = 1,
         lr: float = 0.005,
         batch_size: int = 1,
-        validation_percent: float = 0.15,
+        n_validation_chains: float = 0.15,
         data_path: str = "data/synthetic_data/sigma_0_5/chains/chain_0.csv"
     ):
         self.wiring = AutoNCP(neuron_units, out_features)
         self.ltc_model = CfC(1, self.wiring)
-        self.learn = SequenceLearner(self.ltc_model, lr=lr, data_path=data_path, batch_size=batch_size, validation_percent=validation_percent)
+        self.learn = SequenceLearner(self.ltc_model, lr=lr, data_path=data_path, batch_size=batch_size, n_validation_chains=n_validation_chains)
         self.trainer = pl.Trainer(
             logger=[
                 pl.loggers.CSVLogger("log", name="disease_ncp"),
