@@ -1,5 +1,7 @@
+import datetime
 import os
 import random
+import time
 from typing import Any, Tuple
 
 import matplotlib.pyplot as plt
@@ -38,12 +40,12 @@ class OptunaPruning(PyTorchLightningPruningCallback, pl.Callback):
 
 
 class Encoder(nn.Module):
-    def __init__(self, latent_dim):
+    def __init__(self, latent_dim, n_vars = 1):
         super(Encoder, self).__init__()
         # Define AutoNCP wiring for the encoder
         encoder_wiring = AutoNCP(latent_dim, int(0.3 * latent_dim))
         self.latent_dim = latent_dim
-        self.rnn = CfC(2, encoder_wiring)
+        self.rnn = CfC(n_vars + 1, encoder_wiring, mixed_memory=True)
 
     def forward(self, x, dt):
         combined_input = torch.cat((x, dt), dim=-1)
@@ -52,11 +54,11 @@ class Encoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, hidden_size, output_size):
+    def __init__(self, hidden_size, n_vars=1):
         super(Decoder, self).__init__()
         # Define AutoNCP wiring for the decoder
         decoder_wiring = AutoNCP(hidden_size, int(0.3 * hidden_size))
-        self.rnn = CfC(1, decoder_wiring, proj_size=1)
+        self.rnn = CfC(1, decoder_wiring, proj_size=n_vars, mixed_memory=True)
 
     def forward(self, hidden_state, dt):
         decoder_output, _ = self.rnn(dt, hx=hidden_state)
@@ -89,11 +91,13 @@ class EncoderDecoder(pl.LightningModule):
         """
         config = DEFAULT_NCP_TRAINING_CONFIG
 
-        config["latent_dim"] = trial.suggest_int("latent_dim", 24, 1024)
-        config["learning_rate"] = trial.suggest_float("learning_rate", 1e-5, 1e-1)
-        config["data_config"]["batch_size"] = trial.suggest_int(
-            "batch_size", 128, 2048 * 4
-        )
+        config["latent_dim"] = trial.suggest_int("latent_dim", 16, 512)
+        config["learning_rate"] = trial.suggest_float("learning_rate", 1e-5, 1)
+        # config["data_config"]["batch_size"] = trial.suggest_int(
+        #     "batch_size", 512, 4096
+        # )
+
+        # config["data_config"]["batch_size"] = 2048*4
 
         config["tuning"] = True
 
@@ -107,7 +111,9 @@ class EncoderDecoder(pl.LightningModule):
             pruner=optuna.pruners.MedianPruner(),
             study_name="hyperparam_tuning",
         )
-        study.optimize(EncoderDecoder._objective, n_trials=n_trials, timeout=60*6, show_progress_bar=True)
+        study.optimize(
+            EncoderDecoder._objective, n_trials=n_trials, show_progress_bar=True
+        )
         return study
 
     def _load_trainer(self):
@@ -117,12 +123,11 @@ class EncoderDecoder(pl.LightningModule):
         trainer_callbacks = [
             StochasticWeightAveraging(swa_lrs=1e-3),
             RichProgressBar(),
+            # EarlyStopping(monitor="val_loss", patience=5),
         ]
 
         if self.tuning:
             trainer_callbacks.append(OptunaPruning(self.trial, monitor="val_loss"))
-        else:
-            trainer_callbacks.append(EarlyStopping(monitor="val_loss", patience=5))
 
         self.trainer = pl.Trainer(
             logger=[
@@ -130,10 +135,12 @@ class EncoderDecoder(pl.LightningModule):
                 pl.loggers.CSVLogger("lightning_logs/"),
             ],
             precision="bf16-mixed",
-            max_epochs=25,
+            max_epochs=-1,
             gradient_clip_val=1,
             log_every_n_steps=5,
             callbacks=trainer_callbacks,
+            # max time 5 minutes
+            # max_time=datetime.timedelta(minutes=5),
         )
 
     def training_loop(self):
@@ -183,7 +190,7 @@ class EncoderDecoder(pl.LightningModule):
         self.train_samples = self.config["data_config"]["train_samples"]
         self.val_samples = self.config["data_config"]["val_samples"]
 
-        self.sigma_lvl = self.config.get("sigma_lvl", None)
+        # self.sigma_lvl = self.config.get("sigma_lvl", None)
 
     def forward(self, x_encoder, dt_encoder, dt_decoder):
         hidden_state = self.encoder(x_encoder, dt_encoder)
@@ -191,14 +198,14 @@ class EncoderDecoder(pl.LightningModule):
         return prediction
 
     def training_step(self, batch, batch_idx):
-        x_encoder, dt_encoder, dt_decoder, y = batch
+        x_encoder, dt_encoder, dt_decoder, y, _, _ = batch
         y_pred = self(x_encoder, dt_encoder, dt_decoder)
         loss = nn.MSELoss()(y_pred, y)
         self.log("train_loss", loss)  # Logging to TensorBoard
         return loss
 
     def validation_step(self, batch, batch_idx):
-        x_encoder, dt_encoder, dt_decoder, y = batch
+        x_encoder, dt_encoder, dt_decoder, y, _, _ = batch
         y_pred = self(x_encoder, dt_encoder, dt_decoder)
         val_loss = nn.MSELoss()(y_pred, y)
         self.log("val_loss", val_loss)
@@ -216,19 +223,9 @@ class EncoderDecoder(pl.LightningModule):
         """
         paths = []
 
-        if self.sigma_lvl:
-            chains_path = os.path.join(
-                *os.path.split(self.data_path),
-                "sigma_" + str(self.sigma_lvl).replace(".", "_"),
-                "chains"
-            )
+        for subdir in os.listdir(self.data_path):
+            chains_path = os.path.join(*os.path.split(self.data_path), subdir, "chains")
             paths.append(chains_path)
-        else:
-            for sigma_lvl in os.listdir(self.data_path):
-                chains_path = os.path.join(
-                    *os.path.split(self.data_path), sigma_lvl, "chains"
-                )
-                paths.append(chains_path)
 
         chains = []
         for chains_path in paths:
@@ -277,7 +274,14 @@ class EncoderDecoder(pl.LightningModule):
             - y = [x_5, x_6, x_7, x_8, x_9]
         """
 
-        encoder_x, encoder_dt, decoder_dt, y = [], [], [], []
+        encoder_x, encoder_dt, decoder_dt, y, encoder_states, decoder_states = (
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
 
         with tqdm(total=num_samples, desc="Sampling from chains") as pbar:
             while len(encoder_x) < num_samples:
@@ -293,9 +297,10 @@ class EncoderDecoder(pl.LightningModule):
                 except ValueError:
                     continue
 
+                        
                 encoder_x.append(
                     torch.tensor(
-                        df["emission"][start_idx : start_idx + m].values,
+                        df["var_0"][start_idx : start_idx + m].values,
                         dtype=torch.float,
                     )[:, None]
                 )
@@ -306,21 +311,35 @@ class EncoderDecoder(pl.LightningModule):
                 )
                 decoder_dt.append(
                     torch.tensor(
-                        df["time"][start_idx : start_idx + m_n].values,
+                        df["time"][start_idx + m : start_idx + m_n].values,
                         dtype=torch.float,
                     )[:, None]
                 )
                 y.append(
                     torch.tensor(
-                        df["emission"][start_idx : start_idx + m_n].values,
+                        df["var_0"][start_idx + m : start_idx + m_n].values,
                         dtype=torch.float,
                     )[:, None]
                 )
+
+                encoder_states.append(
+                    torch.tensor(
+                        df["state"][start_idx : start_idx + m].values,
+                        dtype=torch.float,
+                    )[:, None]
+                )
+                decoder_states.append(
+                    torch.tensor(
+                        df["state"][start_idx + m : start_idx + m_n].values,
+                        dtype=torch.float,
+                    )[:, None]
+                )
+
                 pbar.update(1)
-        return encoder_x, encoder_dt, decoder_dt, y
+        return encoder_x, encoder_dt, decoder_dt, y, encoder_states, decoder_states
 
     def _load_datasets(
-        self, m_range: Tuple[int, int] = (50, 400), n_range: Tuple[int, int] = (10, 200)
+        self, m_range: Tuple[int, int] = (100, 300), n_range: Tuple[int, int] = (10, 80)
     ):
         """
         Loads the training and validation dataloaders
@@ -333,6 +352,8 @@ class EncoderDecoder(pl.LightningModule):
 
         train_dfs, val_dfs = self._train_val_split()
 
+        assert "state" in train_dfs[0].columns
+
         train_tuple = self._sample_from_dfs(
             train_dfs, self.train_samples, m_range, n_range
         )
@@ -343,9 +364,8 @@ class EncoderDecoder(pl.LightningModule):
 
         val_tuple = tuple(pad_sequence(seq, batch_first=True) for seq in val_tuple)
 
-        train_dataset, val_dataset = TensorDataset(*train_tuple), TensorDataset(
-            *val_tuple
-        )
+        train_dataset = TensorDataset(*train_tuple)
+        val_dataset = TensorDataset(*val_tuple)
 
         train_dataloader, val_dataloader = DataLoader(
             train_dataset,
@@ -362,14 +382,203 @@ class EncoderDecoder(pl.LightningModule):
 
         self.train_dl, self.val_dl = train_dataloader, val_dataloader
 
-    def predict_step(self, batch, batch_idx, dataloader_idx=0):
-        return self(batch)
+    def predict_dataloader(self) -> EVAL_DATALOADERS:
+        return self.val_dataloader()
+
+    def fine_prediction(self, x_encoder, dt_encoder, start_time, end_time, gran=0.05):
+        """
+        This function is used to generate a prediction with fine granularity.
+        Encodes the sequence [x_encoder, dt_encoder], then decodes a sequence of length
+        (end_time - start_time) / gran, with granularity gran.
+
+        The resulting sequence is a fine-grained prediction of the decoded sequence.
+        """
+
+        # Encode the sequence
+        hidden_state = self.encoder(x_encoder, dt_encoder)
+
+        print(x_encoder.shape)
+        print(hidden_state[0].shape)
+
+        # Decode a sequence of length (end_time - start_time) / gran
+        decoder_dt = torch.ones(int((end_time - start_time) / gran) + 1) * gran
+        decoder_dt = decoder_dt[:, None]
+
+        decoder_output = self.decoder(hidden_state, decoder_dt.cuda())
+
+        # Return the decoded sequence as a pandas dataframe
+        # times should be cumulative
+        df = pd.DataFrame(
+            {
+                "time": decoder_dt.squeeze().detach().numpy(),
+                "prediction": decoder_output.squeeze().detach().cpu().numpy(),
+            }
+        )
+
+        df["time"] = df["time"].cumsum() + start_time
+
+        return df
+
+    def predict_step(
+        self, batch: Any, batch_idx: int, dataloader_idx: int = None
+    ) -> Any:
+        x_encoder, dt_encoder, dt_decoder, _, _, _ = batch
+        y_pred = self(x_encoder, dt_encoder, dt_decoder)
+        return y_pred
+
+    def load_version(version: int):
+        """
+        Loads the model from a given version.
+        """
+        version_checkpoints = os.listdir(
+            f"lightning_logs\\lightning_logs\\version_{version}\\checkpoints"
+        )
+        version_checkpoints.sort()
+        latest_checkpoint = version_checkpoints[-1]
+        return EncoderDecoder.load_from_checkpoint(
+            f"lightning_logs\\lightning_logs\\version_{version}\\checkpoints\\{latest_checkpoint}"
+        )
+
+    @property
+    def n_prediction_samples(self):
+        return self.val_samples
+
+    def plot_prediction_v_real(
+        self, save_path: str = None, sample_number: int = 0, plot_states: bool = False
+    ):
+        """
+        Plots the model's predictions against the real values.
+
+        :param save_path: Path to save the plot to. If None, the plot is shown instead of saved.
+        """
+        self.eval()
+
+        
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.to(device)
+
+        batch = next(iter(self.val_dataloader()))
+        x_encoder, dt_encoder, dt_decoder, y, encoder_states, decoder_states = [tensor.to(device) for tensor in batch]
+
+        y_pred = self(x_encoder, dt_encoder, dt_decoder)
+
+        x_encoder = x_encoder[sample_number]
+        dt_encoder = dt_encoder[sample_number]
+        dt_decoder = dt_decoder[sample_number]
+        y = y[sample_number]
+        y_pred = y_pred[sample_number]
+        encoder_states = encoder_states[sample_number]
+        decoder_states = decoder_states[sample_number]
+
+        # unpad the sequences
+        try:
+            m = torch.where(dt_encoder == 0)[0][0].item()
+        except IndexError:
+            m = dt_encoder.shape[0]
+
+        try:
+            n = torch.where(dt_decoder == 0)[0][0].item()
+        except IndexError:
+            n = dt_decoder.shape[0]
+
+        # m is the index of the first zero element in dt_encoder
+        # m = torch.where(dt_encoder == 0)[0][0].item()
+
+        # # n is the index of the first zero element in dt_decoder
+        # n = torch.where(dt_decoder == 0)[0][0].item()
+
+        # assert n == torch.where(y == 0)[0][0].item()
+        # assert n == torch.where(y_pred == 0)[0].item()
+
+        x_encoder = x_encoder[:m]
+        dt_encoder = dt_encoder[:m]
+        y = y[:n]
+        y_pred = y_pred[:n]
+        dt_decoder = dt_decoder[:n]
+        encoder_states = encoder_states[:m]
+        decoder_states = decoder_states[:n]
+
+        # make a pandas dataframe for the real values
+        df_encoded = pd.DataFrame(
+            {
+                "time": dt_encoder.squeeze().cpu().numpy(),
+                "emission": x_encoder.squeeze().cpu().numpy(),
+                "state": encoder_states.squeeze().cpu().numpy(),
+            }
+        )
+
+        df_encoded["time"] = df_encoded["time"].cumsum()
+
+        # get max time
+        max_time = df_encoded["time"].max()
+
+        df_decoded = pd.DataFrame(
+            {
+                "time": dt_decoder.squeeze().cpu().numpy(),
+                "emission": y.squeeze().cpu().numpy(),
+                "state": decoder_states.squeeze().cpu().numpy(),
+            }
+        )
+
+        df_decoded["time"] = df_decoded["time"].cumsum() + max_time
+
+        # combine the two dataframes
+        df = pd.concat([df_encoded, df_decoded])
+
+        # add a column for the predictions, but with fine granularity
+        prediction_df = self.fine_prediction(
+            x_encoder, dt_encoder, max_time, max_time + dt_decoder.sum()
+        )
+
+        df = pd.merge(df, prediction_df, on="time", how="outer")
+
+        df.set_index("time", inplace=True)
+
+        df.sort_index(inplace=True)
+
+        # plot the real values and the predictions
+        sns.scatterplot(data=df, x="time", y="emission", label="real")
+        sns.lineplot(data=df, x="time", y="prediction", label="prediction", color="g")
+        sns.lineplot(data=df, x="time", y="state", label="state", color="orange")
+
+
+
+        # draw a vertical line at the end of the encoder sequence
+        plt.axvline(x=max_time, color="r", linestyle="--")
+
+        if save_path is not None:
+            plt.savefig(save_path)
+        else:
+            plt.show()
+
+        plt.close()
 
 
 if __name__ == "__main__":
-    study = EncoderDecoder.start_optuna_study(n_trials=50)
+    # study = EncoderDecoder.start_optuna_study(n_trials=50)
 
-    # Save study
-    study_name = "hyperparam_tuning"
-    study_path = os.path.join("data", study_name)
-    study.trials_dataframe().to_csv(os.path.join(study_path, "trials.csv"))
+    # # Save study
+    # study_name = "hyperparam_tuning"
+    # study_path = os.path.join("data", study_name)
+    # study.trials_dataframe().to_csv(os.path.join(study_path, "trials.csv"))
+
+    # enc_dec = EncoderDecoder(DEFAULT_NCP_TRAINING_CONFIG)
+    # enc_dec.training_loop()
+
+    # enc_dec = EncoderDecoder.load_from_checkpoint(
+    #     "lightning_logs\\lightning_logs\\version_138\\checkpoints\\epoch=193-step=776.ckpt"
+    # )
+
+    enc_dec = EncoderDecoder.load_version(22)
+
+    plots_dir = "data\\plots"
+
+    os.makedirs(plots_dir, exist_ok=True)
+
+    for sample_number in range(enc_dec.n_prediction_samples):
+        enc_dec.plot_prediction_v_real(
+            os.path.join(plots_dir, f"prediction_v_real_{sample_number}.png"),
+            sample_number,
+        )
+    # # enc_dec.learning_rate = 1e-4
+    # # enc_dec.training_loop()

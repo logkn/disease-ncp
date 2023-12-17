@@ -20,20 +20,19 @@ class DataConfig(TypedDict):
 class NCPTrainingConfig(TypedDict):
     latent_dim: int
     learning_rate: float
-    sigma_lvl: Optional[float]
     tuning: bool
 
 
 DEFAULT_NCP_TRAINING_CONFIG = NCPTrainingConfig(
-    latent_dim=2,
+    latent_dim=512,
     data_config=DataConfig(
-        data_path="data/synthetic_data",
+        data_path="data/synthetic_data/one_dim/",
         validation_pct=0.3,
-        batch_size=2048*4,
-        train_samples=50000,
+        batch_size=2048,
+        train_samples=15000,
         val_samples=5000,
     ),
     learning_rate=0.005,
-    tuning=True,
+    tuning=False,
     # sigma_lvl=0.5,
 )

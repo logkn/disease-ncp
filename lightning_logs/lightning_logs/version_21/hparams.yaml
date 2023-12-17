@@ -1,0 +1,15 @@
+batch_size: 2048
+config:
+  data_config:
+    batch_size: 2048
+    data_path: data/synthetic_data/one_dim/
+    train_samples: 15000
+    val_samples: 5000
+    validation_pct: 0.3
+  latent_dim: 512
+  learning_rate: 0.005
+  tuning: false
+learning_rate: 0.005
+lr: 0.005
+trial: null
+validation_pct: 0.3
